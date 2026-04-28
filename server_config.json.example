@@ -1,0 +1,6 @@
+{
+  "storage_type": "google",
+  "google_folder_id": "",
+  "refresh_rate_ms": 200,
+  "flush_rate_ms": 300
+}
