@@ -71,6 +71,10 @@ type Engine struct {
 	// OPT: gzip compress mux file payloads before upload.
 	// Auto-detected on receive (gzip magic 0x1f,0x8b vs envelope magic 0x1f,0x20+).
 	compression bool
+
+	// OPT-E4: Pre-computed base64url-encoded client ID.
+	// Avoids calling base64.RawURLEncoding.EncodeToString every poll + every flush.
+	encodedID string
 }
 
 type uploadRecord struct {
@@ -79,16 +83,44 @@ type uploadRecord struct {
 }
 
 // bufPool reuses bytes.Buffer to reduce GC pressure in flushAll.
+// OPT-H5: Buffers larger than 256KB are discarded instead of returned to the pool
+// to prevent a single bulk transfer from permanently inflating pool memory.
+const maxPoolBufSize = 256 * 1024
+
 var bufPool = sync.Pool{
 	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
 
+func putBuf(buf *bytes.Buffer) {
+	if buf.Cap() > maxPoolBufSize {
+		return // let GC collect oversized buffers
+	}
+	bufPool.Put(buf)
+}
+
+// OPT-C1: Pool gzip readers to avoid ~40KB alloc per download.
+var gzipReaderPool = sync.Pool{}
+
+// OPT-C2: Pool bufio.Reader to avoid 64KB alloc per download.
+var bufioReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, 64*1024)
+	},
+}
+
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
+	// OPT-E4: Pre-compute the base64url-encoded client ID once at startup.
+	var encoded string
+	if clientID != "" {
+		encoded = base64.RawURLEncoding.EncodeToString([]byte(clientID))
+	}
+
 	e := &Engine{
 		backend:        backend,
 		id:             clientID,
+		encodedID:      encoded,
 		sessions:       make(map[string]*Session),
 		closedSessions: make(map[string]time.Time),
 		processed:      make(map[string]time.Time),
@@ -267,9 +299,11 @@ func (e *Engine) flushAll(ctx context.Context) {
 			fnameCID = "unknown"
 		}
 
-		// OPT-16 FIX: Encode the clientID with base64url so hyphens in the
-		// client_id config value don't corrupt filename parsing.
-		encodedCID := base64.RawURLEncoding.EncodeToString([]byte(fnameCID))
+		// OPT-E4: Use cached encoded CID when it matches, avoiding per-flush base64 encoding.
+		encodedCID := e.encodedID
+		if fnameCID != e.id {
+			encodedCID = base64.RawURLEncoding.EncodeToString([]byte(fnameCID))
+		}
 		seq := atomic.AddUint64(&e.uploadSeq, 1)
 		filename := fmt.Sprintf("%s-%s-mux-%d-%d.bin", e.myDir, encodedCID, time.Now().UnixNano(), seq)
 
@@ -295,21 +329,44 @@ func (e *Engine) flushAll(ctx context.Context) {
 		if e.compression && buf.Len() > 0 {
 			compBuf := bufPool.Get().(*bytes.Buffer)
 			compBuf.Reset()
-			gw, _ := gzip.NewWriterLevel(compBuf, gzip.BestSpeed)
-			gw.Write(buf.Bytes())
-			gw.Close()
-			bufPool.Put(buf)
-			serialized = make([]byte, compBuf.Len())
-			copy(serialized, compBuf.Bytes())
-			bufPool.Put(compBuf)
+			// Issue 5 fix: handle gzip.NewWriterLevel error instead of discarding.
+			gw, gwErr := gzip.NewWriterLevel(compBuf, gzip.BestSpeed)
+			if gwErr != nil {
+				log.Printf("gzip writer error, sending uncompressed: %v", gwErr)
+				serialized = make([]byte, buf.Len())
+				copy(serialized, buf.Bytes())
+				putBuf(buf)
+				putBuf(compBuf)
+			} else {
+				gw.Write(buf.Bytes())
+				gw.Close()
+				// Issue 6 fix: only use compressed output if actually smaller.
+				// Most HTTPS payloads are already compressed; gzip makes them bigger.
+				if compBuf.Len() < buf.Len() {
+					putBuf(buf)
+					serialized = make([]byte, compBuf.Len())
+					copy(serialized, compBuf.Bytes())
+				} else {
+					serialized = make([]byte, buf.Len())
+					copy(serialized, buf.Bytes())
+					putBuf(buf)
+				}
+				putBuf(compBuf)
+			}
 		} else {
 			serialized = make([]byte, buf.Len())
 			copy(serialized, buf.Bytes())
-			bufPool.Put(buf)
+			putBuf(buf)
 		}
 
 		go func(fname string, data []byte) {
-			e.uploadSem <- struct{}{}
+			// Bug 2 fix: respect ctx.Done() when acquiring semaphore.
+			// Without this, goroutines block forever on shutdown if all slots are occupied.
+			select {
+			case e.uploadSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-e.uploadSem }()
 
 			const maxRetries = 3
@@ -323,7 +380,13 @@ func (e *Engine) flushAll(ctx context.Context) {
 					log.Printf("upload retry %d/%d: %s", attempt+1, maxRetries, fname)
 				}
 
-				uploadCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				// OPT-B5: Scale upload timeout with payload size.
+				// Base 10s + 1s per 50KB. A 500KB mux gets 20s; a 5MB mux gets 110s.
+				timeout := 10*time.Second + time.Duration(len(data)/50000)*time.Second
+				if timeout < 10*time.Second {
+					timeout = 10 * time.Second
+				}
+				uploadCtx, cancel := context.WithTimeout(ctx, timeout)
 				err := e.backend.Upload(uploadCtx, fname, bytes.NewReader(data))
 				cancel()
 
@@ -391,7 +454,8 @@ func (e *Engine) pollLoop(ctx context.Context) {
 
 				prefix := string(e.peerDir) + "-"
 				if e.myDir == DirReq {
-					prefix += base64.RawURLEncoding.EncodeToString([]byte(e.id)) + "-mux-"
+					// OPT-E4: Use cached encoded CID instead of re-encoding each poll.
+					prefix += e.encodedID + "-mux-"
 				}
 				// Server polls for all client request files (prefix = "req-")
 
@@ -400,6 +464,11 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				listCancel()
 				if err != nil {
 					log.Printf("poll list error: %v", err)
+					// OPT-G2: Back off on list failure to avoid hammering a failing API.
+					currentPollInterval = currentPollInterval * 2
+					if currentPollInterval > maxPollInterval {
+						currentPollInterval = maxPollInterval
+					}
 					break
 				}
 
@@ -425,7 +494,10 @@ func (e *Engine) pollLoop(ctx context.Context) {
 
 				// OPT: Sort files by timestamp so oldest (most latency-critical) are
 				// processed first. Files are named "{dir}-{cid}-mux-{ts}-{seq}.bin".
-				sort.Strings(files)
+				// OPT-A3: Skip sort for 0-1 files — no-op but avoids function call overhead.
+				if len(files) > 1 {
+					sort.Strings(files)
+				}
 
 				for _, f := range files {
 					// Parse timestamp from new filename format:
@@ -472,7 +544,12 @@ func (e *Engine) pollLoop(ctx context.Context) {
 // downloadAndProcess handles downloading, decompressing, and dispatching a single mux file.
 // OPT: Extracted from pollLoop for clarity and to add download retry logic.
 func (e *Engine) downloadAndProcess(ctx context.Context, fname string) {
-	e.downloadSem <- struct{}{}
+	// Bug 2 fix: respect ctx.Done() when acquiring semaphore.
+	select {
+	case e.downloadSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
 	defer func() { <-e.downloadSem }()
 
 	// OPT: Download with retry (1 retry on failure).
@@ -523,22 +600,36 @@ func (e *Engine) downloadAndProcess(ctx context.Context, fname string) {
 	}
 	if peek[0] == 0x1f && peek[1] == 0x8b {
 		// Gzip compressed — decompress transparently.
-		gr, err := gzip.NewReader(io.MultiReader(bytes.NewReader(peek), rc))
-		if err != nil {
-			log.Printf("gzip init error %s: %v", fname, err)
-			e.cleanupProcessed(fname)
-			return
+		// OPT-C1: Reuse pooled gzip reader to avoid ~40KB alloc per download.
+		multiR := io.MultiReader(bytes.NewReader(peek), rc)
+		if pooled := gzipReaderPool.Get(); pooled != nil {
+			gr := pooled.(*gzip.Reader)
+			if err := gr.Reset(multiR); err != nil {
+				log.Printf("gzip reset error %s: %v", fname, err)
+				e.cleanupProcessed(fname)
+				return
+			}
+			defer func() { gr.Close(); gzipReaderPool.Put(gr) }()
+			reader = gr
+		} else {
+			gr, err := gzip.NewReader(multiR)
+			if err != nil {
+				log.Printf("gzip init error %s: %v", fname, err)
+				e.cleanupProcessed(fname)
+				return
+			}
+			defer func() { gr.Close(); gzipReaderPool.Put(gr) }()
+			reader = gr
 		}
-		defer gr.Close()
-		reader = gr
 	} else {
 		// Raw envelope data — prepend the peeked bytes.
 		reader = io.MultiReader(bytes.NewReader(peek), rc)
 	}
 
-	// OPT: Wrap in bufio.Reader so multiple small io.ReadFull calls in
-	// Envelope.Decode are served from a single large underlying read.
-	br := bufio.NewReaderSize(reader, 64*1024)
+	// OPT-C2: Reuse pooled bufio.Reader to avoid 64KB alloc per download.
+	br := bufioReaderPool.Get().(*bufio.Reader)
+	br.Reset(reader)
+	defer bufioReaderPool.Put(br)
 
 	// Extract clientID from base64-encoded filename part.
 	// Format: "{dir}-{base64cid}-mux-{ts}-{seq}.bin"
@@ -555,15 +646,25 @@ func (e *Engine) downloadAndProcess(ctx context.Context, fname string) {
 	}
 
 	// Phase 1: Decode ALL envelopes into per-session buckets.
+	// OPT-C4: Abort after 5 consecutive decode errors to stop processing corrupt files.
 	sessionEnvs := make(map[string][]*Envelope)
+	consecutiveErrors := 0
+	const maxDecodeErrors = 5
 	for {
 		env := &Envelope{}
 		if err := env.Decode(br); err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				consecutiveErrors++
 				log.Printf("mux decode error %s: %v", fname, err)
+				if consecutiveErrors >= maxDecodeErrors {
+					log.Printf("WARN: aborting decode of %s after %d consecutive errors", fname, maxDecodeErrors)
+					break
+				}
+				continue // try next envelope
 			}
 			break
 		}
+		consecutiveErrors = 0 // reset on success
 
 		e.closedSessionsMu.Lock()
 		_, isClosed := e.closedSessions[env.SessionID]
@@ -668,11 +769,12 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// OPT: Reduced tombstone TTL from 30s to 15s. Files are deleted
-			// within seconds of processing; 30s was overly conservative.
+			// Issue 7 fix: Increased from 15s to 60s to match idleTimeout.
+			// On Iran's intermittent connections, delayed files >15s would
+			// trigger phantom sessions on the server.
 			e.closedSessionsMu.Lock()
 			for id, t := range e.closedSessions {
-				if time.Since(t) > 15*time.Second {
+				if time.Since(t) > 60*time.Second {
 					delete(e.closedSessions, id)
 				}
 			}

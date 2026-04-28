@@ -91,3 +91,22 @@ func NewCustomClient(cfg TransportConfig) *http.Client {
 		Timeout:   60 * time.Second,
 	}
 }
+
+// WarmUp primes the HTTP connection pool by making a lightweight request.
+// OPT-F7: First real request pays ~300-500ms for TCP+TLS handshake.
+// Calling this at startup moves that cost out of the critical path.
+func WarmUp(client *http.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		"https://www.googleapis.com/drive/v3/about?fields=user", nil)
+	if err != nil {
+		return
+	}
+	// No auth header — will get 401, but TCP+TLS is established and pooled.
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}

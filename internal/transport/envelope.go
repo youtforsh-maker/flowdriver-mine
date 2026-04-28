@@ -63,7 +63,8 @@ func (e *Envelope) MarshalBinary() ([]byte, error) {
 
 // Encode writes the envelope directly to an io.Writer.
 func (e *Envelope) Encode(w io.Writer) error {
-	var hdr [512]byte // Sufficient for most metadata (SID + TargetAddr)
+	// Max header: 1 (magic) + 1 (sidLen) + 255 (SID) + 8 (seq) + 1 (addrLen) + 255 (addr) + 1 (close) + 4 (payLen) = 526
+	var hdr [530]byte
 	hdr[0] = MagicByte
 	hdr[1] = uint8(len(e.SessionID))
 	copy(hdr[2:], e.SessionID)

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -29,15 +30,36 @@ type Session struct {
 
 	txCond *sync.Cond
 	RxChan chan []byte
+
+	// OPT-D5: Maximum number of out-of-order envelopes to buffer.
+	// Prevents unbounded memory growth if packets arrive wildly out-of-order.
+	MaxRxQueueSize int
 }
 
+// DefaultRxChanSize is the default buffered channel size for incoming payloads.
+const DefaultRxChanSize = 1024
+
+// DefaultMaxRxQueueSize caps the out-of-order resequencing buffer.
+// 10000 entries × ~1KB avg payload ≈ 10MB max memory per session.
+const DefaultMaxRxQueueSize = 10000
+
 func NewSession(id string) *Session {
+	return NewSessionWithChanSize(id, DefaultRxChanSize)
+}
+
+// NewSessionWithChanSize creates a session with a custom RxChan buffer size.
+// OPT-D2: Allows tuning via config for different workload profiles.
+func NewSessionWithChanSize(id string, rxChanSize int) *Session {
+	if rxChanSize <= 0 {
+		rxChanSize = DefaultRxChanSize
+	}
 	s := &Session{
-		ID:           id,
-		txBuf:        make([]byte, 0, 32*1024), // OPT: pre-alloc 32KB to avoid early realloc
-		rxQueue:      make(map[uint64]*Envelope),
-		lastActivity: time.Now(),
-		RxChan:       make(chan []byte, 1024),
+		ID:             id,
+		txBuf:          make([]byte, 0, 32*1024), // OPT: pre-alloc 32KB to avoid early realloc
+		rxQueue:        make(map[uint64]*Envelope),
+		lastActivity:   time.Now(),
+		RxChan:         make(chan []byte, rxChanSize),
+		MaxRxQueueSize: DefaultMaxRxQueueSize,
 	}
 	s.txCond = sync.NewCond(&s.mu)
 	return s
@@ -120,17 +142,38 @@ func (s *Session) ProcessRx(env *Envelope) {
 			s.closed = true
 		}
 	} else if env.Seq > s.rxSeq {
-		s.rxQueue[env.Seq] = env
+		// OPT-D5: Bound the resequencing queue to prevent OOM from wildly
+		// out-of-order packets (e.g., if a mux file arrives days late).
+		if s.MaxRxQueueSize > 0 && len(s.rxQueue) >= s.MaxRxQueueSize {
+			log.Printf("WARN: session %s rxQueue full (%d), dropping seq %d", s.ID, len(s.rxQueue), env.Seq)
+		} else {
+			s.rxQueue[env.Seq] = env
+		}
 	}
 	// env.Seq < s.rxSeq → duplicate already delivered, discard silently.
 
 	s.lastActivity = time.Now()
 	s.mu.Unlock() // ← RELEASED before any channel operation
 
-	// These sends can block if the app reader is slow.
-	// s.mu is free, so EnqueueTx, flushAll, and other sessions are unaffected.
+	// OPT-D1: Timeout-aware sends prevent goroutine leaks when consumer is dead.
+	// Without this, a dead VirtualConn.Read or server relay goroutine causes the
+	// dispatch goroutine to hang forever, leaking the download semaphore slot.
 	for _, payload := range toDispatch {
-		s.RxChan <- payload
+		select {
+		case s.RxChan <- payload:
+			// delivered
+		case <-time.After(10 * time.Second):
+			log.Printf("WARN: session %s RxChan blocked for 10s, closing session", s.ID)
+			// Mark session dead so future ProcessRx calls bail out immediately.
+			s.mu.Lock()
+			if !s.rxClosed {
+				s.rxClosed = true
+				s.closed = true
+				close(s.RxChan)
+			}
+			s.mu.Unlock()
+			return
+		}
 	}
 
 	if shouldClose {

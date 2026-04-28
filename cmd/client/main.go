@@ -52,6 +52,8 @@ func main() {
 	var backend storage.Backend
 	if appCfg.StorageType == "google" {
 		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
+		// OPT-F7: Prime TCP+TLS connection pool before first real API call.
+		go httpclient.WarmUp(customHttpClient)
 		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
 	} else {
 		backend, err = storage.NewLocalBackend(appCfg.LocalDir)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -14,8 +15,20 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// QuotaError indicates a Google API quota or permission error (429/403).
+// OPT-G6: Callers can type-assert to back off appropriately.
+type QuotaError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *QuotaError) Error() string {
+	return fmt.Sprintf("quota/permission error %d: %s", e.StatusCode, e.Body)
+}
 
 type oauthClientJSON struct {
 	Installed struct {
@@ -46,21 +59,17 @@ type GoogleBackend struct {
 	refreshToken string
 	tokenEx      time.Time
 	// OPT-17 FIX: Changed from sync.Mutex to sync.RWMutex with double-checked locking.
-	//
-	// Original: exclusive Lock() for the entire getValidToken call, including the
-	// "token is still valid" fast path. All concurrent goroutines serialized through
-	// this single lock — even routine Upload/Download/ListQuery calls where the
-	// token was perfectly fresh. Under 8 concurrent goroutines, this was a constant
-	// serialization bottleneck.
-	//
-	// With RWMutex: all goroutines read the token concurrently (RLock) in the
-	// common case. Only the rare token refresh (~once per hour) takes a write lock.
-	// Double-check after acquiring write lock handles the race where multiple
-	// goroutines all saw an expired token simultaneously.
 	mu sync.RWMutex
 
 	fileIDs   map[string]string
 	fileIdsMu sync.RWMutex
+
+	// OPT-G10: Track insertion order for LRU eviction.
+	fileIDOrder   []string
+
+	// OPT-F9: Circuit breaker — pause API calls after consecutive failures.
+	consecFails  int64 // atomic
+	lastFailTime int64 // atomic, UnixNano
 }
 
 func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBackend {
@@ -69,7 +78,35 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 		saPath:     saPath,
 		folderID:   folderID,
 		fileIDs:    make(map[string]string),
+		fileIDOrder: make([]string, 0, 256),
 	}
+}
+
+// OPT-F9: checkCircuitBreaker returns an error if too many consecutive failures occurred.
+// After 5 failures, all API calls pause for 5 seconds to prevent retry storms.
+const circuitBreakerThreshold = 5
+const circuitBreakerCooldown = 5 * time.Second
+
+func (b *GoogleBackend) checkCircuitBreaker() error {
+	fails := atomic.LoadInt64(&b.consecFails)
+	if fails >= circuitBreakerThreshold {
+		lastFail := time.Unix(0, atomic.LoadInt64(&b.lastFailTime))
+		if time.Since(lastFail) < circuitBreakerCooldown {
+			return fmt.Errorf("circuit breaker open: %d consecutive failures, cooling down", fails)
+		}
+		// Cooldown expired, reset and allow retry
+		atomic.StoreInt64(&b.consecFails, 0)
+	}
+	return nil
+}
+
+func (b *GoogleBackend) recordSuccess() {
+	atomic.StoreInt64(&b.consecFails, 0)
+}
+
+func (b *GoogleBackend) recordFailure() {
+	atomic.AddInt64(&b.consecFails, 1)
+	atomic.StoreInt64(&b.lastFailTime, time.Now().UnixNano())
 }
 
 func (b *GoogleBackend) Login(ctx context.Context) error {
@@ -225,6 +262,9 @@ func (b *GoogleBackend) getValidToken(ctx context.Context) (string, error) {
 }
 
 func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
+	if err := b.checkCircuitBreaker(); err != nil {
+		return err
+	}
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return err
@@ -294,14 +334,21 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
+		b.recordFailure()
 		return err
 	}
 	defer resp.Body.Close()
 
 	respBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		b.recordFailure()
+		// OPT-G6: Return typed error for quota/permission failures.
+		if resp.StatusCode == 429 || resp.StatusCode == 403 {
+			return &QuotaError{StatusCode: resp.StatusCode, Body: string(respBytes)}
+		}
 		return fmt.Errorf("upload returned %d: %s", resp.StatusCode, respBytes)
 	}
+	b.recordSuccess()
 
 	// Store the file ID returned by Drive so Download and Delete can find it
 	// immediately without waiting for a ListQuery to run first.
@@ -311,6 +358,7 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 	if err := json.NewDecoder(bytes.NewReader(respBytes)).Decode(&uploadResult); err == nil && uploadResult.ID != "" {
 		b.fileIdsMu.Lock()
 		b.fileIDs[filename] = uploadResult.ID
+		b.fileIDOrder = append(b.fileIDOrder, filename)
 		b.fileIdsMu.Unlock()
 	}
 
@@ -333,6 +381,9 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 // exhausted. For up to 1,000 files this is still one API call. Beyond 1,000
 // (requiring 100+ concurrent very active clients), pagination kicks in.
 func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string, error) {
+	if err := b.checkCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return nil, err
@@ -367,14 +418,20 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 
 		resp, err := b.httpClient.Do(req)
 		if err != nil {
+			b.recordFailure()
 			return nil, err
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			b.recordFailure()
+			if resp.StatusCode == 429 || resp.StatusCode == 403 {
+				return nil, &QuotaError{StatusCode: resp.StatusCode, Body: string(body)}
+			}
 			return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, body)
 		}
+		b.recordSuccess()
 
 		var resData struct {
 			NextPageToken string `json:"nextPageToken"`
@@ -390,14 +447,28 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		b.fileIdsMu.Lock()
 		for _, f := range resData.Files {
 			if strings.HasPrefix(f.Name, prefix) {
+				if _, exists := b.fileIDs[f.Name]; !exists {
+					b.fileIDOrder = append(b.fileIDOrder, f.Name)
+				}
 				b.fileIDs[f.Name] = f.ID
 				allNames = append(allNames, f.Name)
 			}
 		}
-		// Safety: prevent fileIDs from unbounded growth if entries accumulate
-		// faster than they're deleted (e.g., persistent Delete failures).
+		// OPT-G10: LRU eviction instead of nuclear map reset.
+		// Evict the oldest 25% of entries instead of losing ALL active fileIDs.
 		if len(b.fileIDs) > 5000 {
-			b.fileIDs = make(map[string]string)
+			evictCount := len(b.fileIDOrder) / 4
+			if evictCount < 100 {
+				evictCount = 100
+			}
+			if evictCount > len(b.fileIDOrder) {
+				evictCount = len(b.fileIDOrder)
+			}
+			for _, name := range b.fileIDOrder[:evictCount] {
+				delete(b.fileIDs, name)
+			}
+			b.fileIDOrder = b.fileIDOrder[evictCount:]
+			log.Printf("OPT-G10: evicted %d oldest fileID entries, %d remain", evictCount, len(b.fileIDs))
 		}
 		b.fileIdsMu.Unlock()
 
@@ -411,6 +482,10 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 }
 
 func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
+	if err := b.checkCircuitBreaker(); err != nil {
+		return nil, err
+	}
+
 	b.fileIdsMu.RLock()
 	fileID, ok := b.fileIDs[filename]
 	b.fileIdsMu.RUnlock()
@@ -433,19 +508,29 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
+		b.recordFailure()
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		b.recordFailure()
+		if resp.StatusCode == 429 || resp.StatusCode == 403 {
+			return nil, &QuotaError{StatusCode: resp.StatusCode, Body: string(body)}
+		}
 		return nil, fmt.Errorf("download returned %d: %s", resp.StatusCode, body)
 	}
+	b.recordSuccess()
 
 	return resp.Body, nil
 }
 
 func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
+	if err := b.checkCircuitBreaker(); err != nil {
+		return err
+	}
+
 	b.fileIdsMu.RLock()
 	fileID, ok := b.fileIDs[filename]
 	b.fileIdsMu.RUnlock()
@@ -468,14 +553,20 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
+		b.recordFailure()
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		b.recordFailure()
+		if resp.StatusCode == 429 || resp.StatusCode == 403 {
+			return &QuotaError{StatusCode: resp.StatusCode, Body: string(body)}
+		}
 		return fmt.Errorf("delete returned %d: %s", resp.StatusCode, body)
 	}
+	b.recordSuccess()
 
 	b.fileIdsMu.Lock()
 	delete(b.fileIDs, filename)
